@@ -1,0 +1,26 @@
+name: Disparar webhook n8n
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "Contenido opcional a enviar en el webhook"
+        required: false
+        default: "{}"
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    env:
+      N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+    steps:
+      - name: Verificar webhook configurado
+        if: env.N8N_WEBHOOK_URL == ''
+        run: echo "N8N_WEBHOOK_URL no está definido. Nada que ejecutar."
+      - name: Enviar webhook
+        if: env.N8N_WEBHOOK_URL != ''
+        run: |
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            --data '${{ github.event.inputs.payload || '{}' }}' \
+            "$N8N_WEBHOOK_URL"

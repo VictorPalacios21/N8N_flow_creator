@@ -1,0 +1,31 @@
+name: Importar flujos a n8n
+
+on:
+  pull_request_target:
+    types:
+      - labeled
+
+jobs:
+  import:
+    if: github.event.label.name == 'import-to-n8n'
+    runs-on: ubuntu-latest
+    env:
+      N8N_IMPORT_MODE: create-only
+      N8N_URL: ${{ secrets.N8N_URL }}
+      N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validar contratos pendientes
+        run: node scripts/validate_contract.mjs patches/pending
+        working-directory: ai-flow-orchestrator
+      - name: Importar a n8n (create-only)
+        env:
+          N8N_URL: ${{ env.N8N_URL }}
+          N8N_API_KEY: ${{ env.N8N_API_KEY }}
+        run: node scripts/n8n_upsert.mjs patches/pending
+        working-directory: ai-flow-orchestrator
