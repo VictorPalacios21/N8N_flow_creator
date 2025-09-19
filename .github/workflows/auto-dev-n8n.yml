@@ -1,0 +1,157 @@
+name: Auto Dev n8n (import + verify + iterate)
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  run:
+    if: contains(github.event.pull_request.labels.*.name, 'auto-dev') || contains(github.event.pull_request.labels.*.name, 'import-to-n8n')
+    runs-on: ubuntu-latest
+    env:
+      MAX_ATTEMPTS: "3"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate contract(s)
+        run: node scripts/validate_contract.mjs patches/pending
+
+      - name: Import to n8n (create-only)
+        env:
+          N8N_URL: ${{ secrets.N8N_URL }}
+          N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+        run: node scripts/n8n_upsert.mjs patches/pending
+
+      - name: Verify (existence + optional webhook test)
+        env:
+          N8N_URL: ${{ secrets.N8N_URL }}
+          N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+          N8N_WEBHOOK_BASE: ${{ secrets.N8N_WEBHOOK_BASE }}
+        run: node scripts/verify_n8n.mjs patches/pending
+
+      - name: Comment verification results on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = '.gh-output/verification.json';
+            const data = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'No verification output found.';
+            const body = "### n8n verification results\n```\n" + data + "\n```";
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+      - name: Decide / Instruct Codex if failed
+        id: decide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = '.gh-output/verification.json';
+            const max = parseInt(process.env.MAX_ATTEMPTS || '3', 10);
+
+            function getAttemptCount(comments) {
+              const tag = 'AUTO-DEV-ATTEMPT:';
+              let maxN = 0;
+              for (const c of comments.data) {
+                const m = (c.body || '').match(new RegExp(`${tag}\s*(\\d+)`));
+                if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
+              }
+              return maxN;
+            }
+
+            let ok = false, verification = null;
+            if (fs.existsSync(path)) {
+              verification = JSON.parse(fs.readFileSync(path, 'utf8'));
+              ok = !!verification.ok;
+            }
+
+            if (ok) {
+              core.setOutput('status', 'ok');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: "✅ Verificación OK. Puedes opcionalmente hacer merge."
+              });
+              return;
+            }
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100
+            });
+            const attempt = getAttemptCount(comments) + 1;
+
+            if (attempt > max) {
+              core.setOutput('status', 'maxed');
+              const msg = "❌ Verificación fallida tras " + (attempt-1) + " intentos. Revisión humana requerida.";
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: msg
+              });
+              core.setFailed("Max attempts reached");
+              return;
+            }
+
+            const needWebhookBase = !process.env.N8N_WEBHOOK_BASE;
+            const needSecrets = !process.env.N8N_URL || !process.env.N8N_API_KEY;
+            let clarifications = [];
+            if (needSecrets) clarifications.push("- Falta configurar N8N_URL y/o N8N_API_KEY en GitHub Secrets.");
+            if (needWebhookBase) clarifications.push("- Falta N8N_WEBHOOK_BASE si la verificación es de tipo webhook.");
+
+            const prompt = [
+              "AUTO-DEV-ATTEMPT: " + attempt,
+              "",
+              "Asumir como 'Desarrollador n8n auto-iterativo'.",
+              "Debes corregir los parches en patches/pending para que la verificación pase.",
+              "Diagnóstico de verificación:",
+              "```json",
+              fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : '{"ok":false,"results":[]}',
+              "```",
+              "Reglas:",
+              "- Mantén target='n8n' y artifacts[].mode='overwrite'.",
+              "- Devuelve EXPORT COMPLETO de n8n (nodes + connections), sin secretos.",
+              "- Usa nodos CE; para APIs usa HTTP Request.",
+              "- Si es webhook, asegúrate de que el path/método existan y la respuesta coincida exactamente con verification.expect.",
+              "- Actualiza los mismos archivos en patches/pending (no crees rutas nuevas).",
+              "- Cambios incrementales por intento.",
+              "",
+              clarifications.length ? "Faltan datos/credenciales:\n" + clarifications.join("\n") : ""
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: prompt
+            });
+
+            core.setOutput('status', 'needs-fix');
+
+      - name: Exit to wait for next attempt
+        if: steps.decide.outputs.status == 'needs-fix'
+        run: |
+          echo "Esperando ajuste de Codex (ver comentario en el PR)."
+          exit 1
+
+      - name: Done
+        if: steps.decide.outputs.status == 'ok'
+        run: echo "Flujo verificado con éxito."
